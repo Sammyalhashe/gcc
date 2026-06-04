@@ -1,0 +1,12 @@
+inputs:
+  devenv:
+    url: git+ssh://git@github.com/cachix/devenv
+  mk-shell-bin:
+    url: git+ssh://git@github.com/rrbutani/nix-mk-shell-bin
+  nix2container:
+    url: git+ssh://git@github.com/nlewo/nix2container
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  nixpkgs:
+    url: git+ssh://git@github.com/cachix/devenv-nixpkgs?ref=rolling

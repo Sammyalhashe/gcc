@@ -701,8 +701,7 @@ strict_aliasing_warning (location_t loc, tree type, tree expr)
   STRIP_NOPS (expr);
   tree otype = TREE_TYPE (expr);
 
-  if (!(flag_strict_aliasing
-	&& POINTER_TYPE_P (type)
+  if (!(POINTER_TYPE_P (type)
 	&& POINTER_TYPE_P (otype)
 	&& !VOID_TYPE_P (TREE_TYPE (type)))
       /* If the type we are casting to is a ref-all pointer
