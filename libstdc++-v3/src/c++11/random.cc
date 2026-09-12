@@ -27,6 +27,7 @@
 
 #include <random>
 #include <system_error>
+#include <cstdlib>
 
 #if defined __i386__ || defined __x86_64__
 # include <cpuid.h>
@@ -98,6 +99,25 @@ namespace std _GLIBCXX_VISIBILITY(default)
     __throw_syserr([[maybe_unused]] int e, [[maybe_unused]] const char* msg)
     { _GLIBCXX_THROW_OR_ABORT(system_error(e, std::generic_category(), msg)); }
 
+
+// TODO: REMOVE THIS - This is for testing only
+#if USE_RDRAND || USE_RDSEED
+    // SCRATCH BUILD ONLY -- revert before committing.
+    //   GLIBCXX_RDRAND_BROKEN=always -> every draw returns all-ones
+    //   GLIBCXX_RDRAND_BROKEN=<N>    -> first N draws all-ones, then recover
+    inline bool
+    __inject_all_ones()
+    {
+      static const char* const mode = std::getenv("GLIBCXX_RDRAND_BROKEN");
+      if (!mode)
+      return false;
+      if (mode[0] == 'a')
+      return true;
+      static int budget = std::atoi(mode);
+      return budget-- > 0;
+    }
+#endif
+
 #if USE_RDRAND
     unsigned int
     __attribute__ ((target("rdrnd")))
@@ -110,6 +130,8 @@ namespace std _GLIBCXX_VISIBILITY(default)
 	if (--retries == 0)
 	  std::__throw_runtime_error(__N("random_device: rdrand failed"));
 
+      if (__inject_all_ones()) [[__unlikely__]]
+	return 0xffffffff;
       return val;
     }
 #endif
@@ -133,6 +155,8 @@ namespace std _GLIBCXX_VISIBILITY(default)
 	  __builtin_ia32_pause();
 	}
 
+      if (__inject_all_ones()) [[__unlikely__]]
+	return 0xffffffff;
       return val;
     }
 
@@ -144,6 +168,62 @@ namespace std _GLIBCXX_VISIBILITY(default)
       return __x86_rdseed(reinterpret_cast<void*>(&__x86_rdrand));
     }
 #endif
+#endif
+
+#if USE_RDRAND || USE_RDSEED
+    // Check availability of cpuid and if supported, return ebx register.
+    // The ebx register can be used to identify the cpu manufacturer.
+    inline unsigned int
+    __x86_cpu_sig_ebx() noexcept
+    {
+      unsigned int ebx;
+      if (__get_cpuid_max(0, &ebx) > 0) {
+	return ebx;
+      }
+      return 0;
+    }
+
+    inline bool
+    __x86_cpu_supports_rdrand() noexcept
+    {
+#ifdef USE_RDRAND
+      unsigned int eax, ebx, ecx, edx;
+      // CPUID.01H:ECX.RDRAND[bit 30]
+      __cpuid(1, eax, ebx, ecx, edx);
+      return ecx & bit_RDRND;
+#else
+      return false;
+#endif
+    }
+
+    inline bool
+    __x86_cpu_supports_rdseed() noexcept
+    {
+      unsigned int eax, ebx, ecx, edx;
+      // CPUID.(EAX=07H, ECX=0H):EBX.RDSEED[bit 18]
+      __cpuid_count(7, 0, eax, ebx, ecx, edx);
+      return ebx & bit_RDSEED;
+    }
+
+    // Workaround AMD Ryzen 3000 bug, see PR libstdc++/100444
+    unsigned int
+    __x86_amd_workaround(void* fx)
+    {
+      auto f = reinterpret_cast<unsigned int(*)(void*)>(fx);
+      auto n = f(nullptr);
+      const unsigned int ALL_ONES = 0xffffffff;
+      if (n == 0xffffffff) {
+	int retries = 10;
+	while (--retries && n == ALL_ONES) {
+	  n = f(nullptr);
+	}
+	if (retries == 0) {
+	  std::__throw_runtime_error(__N("random_device: AMD Ryzen 3000 bug detected, "
+					 "BIOS update is required."));
+	}
+      }
+      return n;
+    }
 #endif
 
 #ifdef USE_DARN
@@ -243,7 +323,7 @@ namespace std _GLIBCXX_VISIBILITY(default)
 
     enum Which : unsigned {
       device_file = 1, prng = 2, rand_s = 4, getentropy = 8, arc4random = 16,
-      rdseed = 64, rdrand = 128, darn = 256,
+      rdseed = 64, rdrand = 128, darn = 256, amd_workaround = 512,
       any = 0xffff
     };
 
@@ -277,6 +357,12 @@ namespace std _GLIBCXX_VISIBILITY(default)
 #ifdef USE_DARN
       if (func == &__ppc_darn)
 	return darn;
+#endif
+
+#if defined USE_RDRAND || defined USE_RDSEED
+      if (func == &__x86_amd_workaround) {
+	return which_source(reinterpret_cast<result_type(*)(void*)>(file), nullptr);
+      }
 #endif
 
 #ifdef _GLIBCXX_USE_DEV_RANDOM
@@ -412,31 +498,33 @@ namespace std _GLIBCXX_VISIBILITY(default)
 #ifdef USE_RDSEED
     if (which & rdseed)
     {
-      unsigned int eax, ebx, ecx, edx;
-      // Check availability of cpuid and, for now at least, also the
-      // CPU signature for Intel, AMD and Hygon.
-      if (__get_cpuid_max(0, &ebx) > 0
-	  && (ebx == signature_INTEL_ebx
-	      || ebx == signature_AMD_ebx
-	      || ebx == signature_HYGON_ebx))
+      const unsigned int sig_ebx = __x86_cpu_sig_ebx();
+      // For now, we only use RDSEED for Intel, AMD, and Hygon
+      // processors.
+      if (sig_ebx == signature_INTEL_ebx
+	  || sig_ebx == signature_AMD_ebx
+	  || sig_ebx == signature_HYGON_ebx)
+      {
+	if (__x86_cpu_supports_rdseed())
 	{
-	  // CPUID.(EAX=07H, ECX=0H):EBX.RDSEED[bit 18]
-	  __cpuid_count(7, 0, eax, ebx, ecx, edx);
-	  if (ebx & bit_RDSEED)
-	    {
-#ifdef USE_RDRAND
-	      // CPUID.01H:ECX.RDRAND[bit 30]
-	      __cpuid(1, eax, ebx, ecx, edx);
-	      if (ecx & bit_RDRND)
-		{
-		  _M_func = &__x86_rdseed_rdrand;
-		  return;
-		}
-#endif
-	      _M_func = &__x86_rdseed;
-	      return;
-	    }
+	  if (__x86_cpu_supports_rdrand())
+	  {
+	    _M_func = &__x86_rdseed_rdrand;
+	  }
+	  else
+	  {
+	    _M_func = &__x86_rdseed;
+	  }
+
+	  // AMD 3000 Workaround
+	  if (sig_ebx == signature_AMD_ebx)
+	  {
+	    _M_file = reinterpret_cast<void*>(_M_func);
+	    _M_func = &__x86_amd_workaround;
+	  }
+	  return;
 	}
+      }
       err = unsupported;
     }
 #endif // USE_RDSEED
@@ -444,22 +532,23 @@ namespace std _GLIBCXX_VISIBILITY(default)
 #ifdef USE_RDRAND
     if (which & rdrand)
     {
-      unsigned int eax, ebx, ecx, edx;
-      // Check availability of cpuid and, for now at least, also the
-      // CPU signature for Intel, AMD and Hygon.
-      if (__get_cpuid_max(0, &ebx) > 0
-	  && (ebx == signature_INTEL_ebx
-	      || ebx == signature_AMD_ebx
-	      || ebx == signature_HYGON_ebx))
-	{
-	  // CPUID.01H:ECX.RDRAND[bit 30]
-	  __cpuid(1, eax, ebx, ecx, edx);
-	  if (ecx & bit_RDRND)
-	    {
-	      _M_func = &__x86_rdrand;
-	      return;
-	    }
+      const unsigned int sig_ebx = __x86_cpu_sig_ebx();
+      // For now, we only use RDSEED for Intel, AMD, and Hygon
+      // processors.
+      if (sig_ebx == signature_INTEL_ebx
+	  || sig_ebx == signature_AMD_ebx
+	  || sig_ebx == signature_HYGON_ebx)
+      {
+	if (__x86_cpu_supports_rdrand()) {
+	  _M_func = &__x86_rdrand;
+	  if (sig_ebx == signature_AMD_ebx)
+	  {
+	    _M_file = reinterpret_cast<void*>(_M_func);
+	    _M_func = &__x86_amd_workaround;
+	  }
+	  return;
 	}
+      }
       err = unsupported;
     }
 #endif // USE_RDRAND
@@ -583,6 +672,11 @@ namespace std _GLIBCXX_VISIBILITY(default)
     // _M_file == nullptr means no resources to free.
     if (!_M_file)
       return;
+
+#if USE_RDRAND || USE_RDSEED
+    if (_M_func == &__x86_amd_workaround)
+      return;
+#endif
 
 #if USE_LCG
     if (_M_func == &__lcg)
